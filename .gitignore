@@ -1,0 +1,27 @@
+node_modules/
+dist/
+.next/
+out/
+.turbo/
+coverage/
+*.tsbuildinfo
+
+.env
+.env.*
+!.env.example
+
+# Never commit a Hedera key. The guard in CI also greps for 302e/302a DER prefixes.
+*.key
+*.pem
+secrets/
+.agents/
+.claude/*
+.agents/*
+
+.DS_Store
+*.log
+.pnpm-store/
+.vitest/
+
+# Claude Design handoff bundle — keep the source of truth for the UI
+!surface-selection-decision/
