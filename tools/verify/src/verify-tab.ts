@@ -13,12 +13,22 @@
  *
  * Exits non-zero on failure.
  */
-import { LOCAL_ONLY_INVARIANTS, checkFloatInvariant, checkPublicLedger, position } from '@tab/ledger'
-import { compareConsensus, configureGlobalHttp, MirrorClient, getBalanceSnapshot } from '@tab/mirror'
-import { add, format, micro, usdc, type MicroUsdc } from '@tab/money'
+import {
+  checkFloatInvariant,
+  checkPublicLedger,
+  LOCAL_ONLY_INVARIANTS,
+  position,
+} from '@tab/ledger'
+import {
+  compareConsensus,
+  configureGlobalHttp,
+  getBalanceSnapshot,
+  MirrorClient,
+} from '@tab/mirror'
+import { add, format, type MicroUsdc, micro, usdc } from '@tab/money'
 import { caps } from '@tab/params'
 import { mergeReplays, replayTopic } from './replay.ts'
-import { TAB_GUIDANCE, claim, field, heading, verdict } from './report.ts'
+import { claim, field, heading, TAB_GUIDANCE, verdict } from './report.ts'
 
 configureGlobalHttp({ connectTimeoutMs: 60_000 })
 
@@ -88,7 +98,7 @@ console.log(heading('verify-tab', 'HCS receipts vs on-chain balances'))
 console.log(field('network', network))
 console.log(field('receipt topic', receiptTopic))
 console.log(field('settlements', settlementTopic))
-console.log(field('token', tokenId))
+console.log(field('token', tokenId, 'only receipts denominated in THIS token are asserted'))
 console.log(field('hot float', hotFloat))
 console.log(field('treasury', treasury ?? 'not configured — the invariant spans one account'))
 
@@ -129,11 +139,19 @@ const asOf =
 console.log()
 console.log(field('hot float bal', format(hotSnapshot.balance), `as of ${hotSnapshot.asOf}`))
 if (treasurySnapshot) {
-  console.log(field('treasury bal', format(treasurySnapshot.balance), `as of ${treasurySnapshot.asOf}`))
+  console.log(
+    field('treasury bal', format(treasurySnapshot.balance), `as of ${treasurySnapshot.asOf}`),
+  )
 }
-console.log(field('replay bounded', `to ${asOf}`, 'the older snapshot — balances are not live reads'))
 console.log(
-  field('fee payer HBAR', `${(Number(hotSnapshot.tinybars) / 1e8).toFixed(4)} ℏ`, 'runway for fees'),
+  field('replay bounded', `to ${asOf}`, 'the older snapshot — balances are not live reads'),
+)
+console.log(
+  field(
+    'fee payer HBAR',
+    `${(Number(hotSnapshot.tinybars) / 1e8).toFixed(4)} ℏ`,
+    'runway for fees',
+  ),
 )
 
 /* ── the checks ─────────────────────────────────────────────────────────── */
@@ -165,9 +183,22 @@ console.log(
   ),
 )
 
+/*
+ * Count what is excluded for having no token, once, before the loop.
+ *
+ * Receipts written before the `tok` field existed carry no currency at all, and
+ * an absent token must NOT be assumed to be the current one — a deployment that
+ * switched tokens leaves one topic holding amounts in two currencies, and
+ * summing them would add TUSD to USDC and report the total as money. So they
+ * are excluded from any balance assertion and counted in the report.
+ */
+let untokened = 0
+
 for (const [tab, all] of byTab) {
-  // Bounded to the snapshot, in consensus order.
-  const entries = all.filter((e) => compareConsensus(e.at, asOf) <= 0)
+  // Bounded to the snapshot, in consensus order, and to THIS token.
+  const inWindow = all.filter((e) => compareConsensus(e.at, asOf) <= 0)
+  untokened += inWindow.filter((e) => e.token === undefined).length
+  const entries = inWindow.filter((e) => e.token === tokenId)
   const p = position(entries, caps.starterCeiling, asOf)
   outstandingTotal = add(outstandingTotal, p.outstanding)
 
@@ -208,7 +239,10 @@ for (const [tab, all] of byTab) {
 if (byTab.size === 0) {
   results.push({
     ok: true,
-    text: claim(true, 'no receipts on the topic — nothing to contradict, and nothing proven either'),
+    text: claim(
+      true,
+      'no receipts on the topic — nothing to contradict, and nothing proven either',
+    ),
   })
 }
 
@@ -217,7 +251,7 @@ for (const r of results) console.log(r.text)
 /*
  * Say what this command cannot check — and say when that list is EMPTY.
  *
- * It used to name `debit_has_hold` and `commit_amount_matches_hold`, because
+ * It used to name `debit_has_hold` and `commit_within_hold`, because
  * holds were never published and an HCS replay showed debits appearing from
  * nowhere. Holds are on the topic now, so the write-ahead ordering is
  * externally checkable and the list is empty.
@@ -226,6 +260,20 @@ for (const r of results) console.log(r.text)
  * hear made explicitly — silence there is indistinguishable from a verifier
  * that forgot to mention what it left out.
  */
+if (untokened > 0) {
+  console.log()
+  console.log(
+    claim(true, `${untokened} receipt(s) carry no token and are EXCLUDED from the balance check`, [
+      'They were written before receipts recorded a currency, so their amounts',
+      'are denominated in whatever token the deployment had configured at the',
+      'time — which a stranger cannot determine from the topic. Summing them',
+      'against a balance in one token would add two currencies together.',
+      'A real gap in the history, not a defaulting rule. Every receipt written',
+      'since carries `tok`.',
+    ]),
+  )
+}
+
 console.log()
 console.log(
   LOCAL_ONLY_INVARIANTS.length === 0
@@ -274,7 +322,9 @@ if (floatTotal === undefined) {
     claim(
       ok,
       `treasury + hot float == float total + outstanding  (${format(held)} vs ${format(add(floatTotal, outstandingTotal))})`,
-      ok ? [`float total ${format(floatTotal)} · outstanding ${format(outstandingTotal)}`] : violations.map((v) => v.detail),
+      ok
+        ? [`float total ${format(floatTotal)} · outstanding ${format(outstandingTotal)}`]
+        : violations.map((v) => v.detail),
     ),
   )
   results.push({ ok, text: '' })
