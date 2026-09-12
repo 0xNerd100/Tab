@@ -13,30 +13,33 @@
  * tools/probes/README.md for the measurements and their caveats.
  */
 export {
+  type Asset,
+  atomicAmount,
+  formatAtomic,
   HBAR,
+  hbarAsset,
   MICRO_PER_TOKEN,
   NETWORKS,
   TESTNET_USDC,
   TINYBAR_PER_HBAR,
-  atomicAmount,
-  formatAtomic,
-  hbarAsset,
   tokenAsset,
-  type Asset,
 } from './assets.ts'
-
 export {
-  asFacilitatorClient,
-  createFacilitator,
-  type FacilitatorConfig,
-  type TabFacilitator,
-} from './facilitator.ts'
-
-export { createEarnServer, type EarnRouteConfig, type EarnServer } from './server.ts'
-
+  BLOCKY402_TESTNET,
+  type Blocky402Config,
+  blocky402FeePayer,
+  createBlocky402Facilitator,
+} from './blocky402.ts'
 export {
   createSpendClient,
   type SpendClient,
   type SpendClientConfig,
   type SpendResult,
 } from './client.ts'
+export {
+  asFacilitatorClient,
+  createFacilitator,
+  type FacilitatorConfig,
+  type TabFacilitator,
+} from './facilitator.ts'
+export { createEarnServer, type EarnRouteConfig, type EarnServer } from './server.ts'

@@ -7,50 +7,66 @@
  * tools/verify — which a stranger runs with no access to our infrastructure —
  * validates against the same file.
  */
+
+export { canonicalHash, canonicalize } from './canonical.ts'
 export {
-  SCHEMA_VERSION,
   amount,
+  type Base,
   base,
   basisPoints,
   consensusTimestamp,
   entityId,
+  SCHEMA_VERSION,
   shortHash,
   windowIndex,
-  type Base,
 } from './common.ts'
-
 export {
-  REFUSAL_CODES,
-  REFUSAL_GUIDANCE,
-  isRetryable,
-  type RefusalCode,
-} from './refusal-codes.ts'
-
-export { canonicalHash, canonicalize } from './canonical.ts'
-
+  base58,
+  type Hcs14Agent,
+  hcs14Aid,
+  hcs14Canonical,
+  hcs14Uaid,
+  tabAgent,
+} from './hcs14.ts'
 export {
+  type CeilingInputs,
+  type CeilingUpdate,
+  type CreditReceipt,
   ceilingInputs,
   ceilingUpdate,
   creditReceipt,
+  type DebitReceipt,
   debitReceipt,
+  type GraphFact,
+  graphFact,
+  type HoldReceipt,
   holdReceipt,
+  type Receipt,
+  type RefusalReceipt,
+  type Registration,
+  type RepairReceipt,
   receipt,
   refusalReceipt,
   registration,
   repairReceipt,
-  settlement,
-  tabMessage,
-  type CeilingInputs,
-  type CeilingUpdate,
-  type CreditReceipt,
-  type DebitReceipt,
-  type HoldReceipt,
-  type Receipt,
-  type Registration,
-  type RefusalReceipt,
-  type RepairReceipt,
   type Settlement,
+  settlement,
   type TabMessage,
+  tabMessage,
+  type WeightUpdate,
+  weightUpdate,
 } from './messages.ts'
-
-export { encode, decode, MAX_MESSAGE_BYTES, type DecodeResult } from './wire.ts'
+export {
+  isRetryable,
+  REFUSAL_CODES,
+  REFUSAL_GUIDANCE,
+  type RefusalCode,
+} from './refusal-codes.ts'
+export {
+  BLOCKING_REASONS,
+  isBlocking,
+  WEIGHT_REASON_DETAIL,
+  WEIGHT_REASONS,
+  type WeightReason,
+} from './weight-reasons.ts'
+export { type DecodeResult, decode, encode, MAX_MESSAGE_BYTES } from './wire.ts'

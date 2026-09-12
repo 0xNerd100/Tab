@@ -1,5 +1,5 @@
 {
-  "name": "@tab/protocol",
+  "name": "@tab/sdk",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -14,7 +14,8 @@
   },
   "dependencies": {
     "@tab/money": "workspace:*",
-    "zod": "catalog:"
+    "@tab/params": "workspace:*",
+    "@tab/protocol": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

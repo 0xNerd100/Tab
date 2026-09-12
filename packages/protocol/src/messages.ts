@@ -1,13 +1,7 @@
 import { z } from 'zod'
-import {
-  amount,
-  base,
-  basisPoints,
-  consensusTimestamp,
-  entityId,
-  shortHash,
-} from './common.ts'
+import { amount, base, basisPoints, consensusTimestamp, entityId, shortHash } from './common.ts'
 import { REFUSAL_CODES } from './refusal-codes.ts'
+import { WEIGHT_REASONS } from './weight-reasons.ts'
 
 /**
  * Every message Tab publishes to HCS.
@@ -136,6 +130,124 @@ export const receipt = z.discriminatedUnion('t', [
 /* ── ceilings topic ─────────────────────────────────────────────────────── */
 
 /**
+ * One counterparty's independence weight, published.
+ *
+ * ONE MESSAGE PER COUNTERPARTY, deliberately. The obvious alternative — an
+ * array of weights inside the ceiling message — hits the **1024-byte
+ * single-chunk limit** the moment an agent has a handful of counterparties, and
+ * `encode()` refuses anything larger because a chunked payload read partially
+ * parses as truncated JSON. A message per counterparty is small, incremental,
+ * and cannot overflow.
+ *
+ * The cost, as with holds: N messages per window rather than one. At scale the
+ * answer is a batch commitment, not a bigger message.
+ *
+ * Published because the engine computed these and published them NOWHERE — the
+ * strongest artifact in the demo, the three-way weight table, existed only in
+ * engine stdout. A number nobody can read is a number nobody can check.
+ */
+export const weightUpdate = base.extend({
+  t: z.literal('weight'),
+  /** The counterparty being weighted. */
+  cp: entityId,
+  /** Independence weight in basis points. 10000 counts in full, 0 blocks. */
+  bp: basisPoints,
+  /**
+   * Every reason that applied, most severe first. Never empty.
+   *
+   * A weight with no reason is useless in the console and useless in a dispute:
+   * the question an operator asks is not "what weight" but "why".
+   */
+  why: z.array(z.enum(WEIGHT_REASONS)).min(1).max(9),
+  /** True when a reason is fatal — the spend is refused, not discounted. */
+  block: z.boolean(),
+  /** Revenue attributed to this counterparty over the trailing span. */
+  rev: amount,
+  /** Its share of total revenue, basis points. */
+  share: basisPoints,
+  /**
+   * The parameter set the discount steps came from, e.g. `tab-v3`.
+   *
+   * Without this a published weight is not verifiable, only readable. The
+   * message says `bp 3360 · why [SHARED_FUNDING_ROOT, YOUNG_ACCOUNT,
+   * CONCENTRATED]` — and checking that 3360 follows from those reasons needs
+   * the discount steps, which are frozen per version. A reader with no version
+   * cannot know which set to resolve, so `verify-weights` reports such a
+   * message as NOT VERIFIABLE rather than guessing at the current one.
+   *
+   * Optional for backward compatibility with the weight messages published
+   * before it existed, and with those published under v1 and v2, which had no
+   * frozen weight policy at all. Absent means unverifiable — never "assume
+   * current", which would check an old weight against numbers that were not in
+   * force when it was written.
+   */
+  model: z.string().min(3).max(32).optional(),
+})
+
+/**
+ * One account's observed graph facts — creation time and funder.
+ *
+ * ## Why this exists
+ *
+ * The independence graph **failed open**. Funding ancestry was re-derived every
+ * pass from Mirror Node's transactions-by-account index, which is *intermittent*
+ * for new accounts — measured returning 5 transactions once and 0 both before
+ * and after, minutes apart. When the lookup failed the counterparty was
+ * weighted **independent**, the unsafe direction. That is not theoretical: the
+ * loop attacker went uncaught on its first full run because of exactly this.
+ *
+ * The fix is to record a fact WHEN OBSERVED and never forget it. That was
+ * scoped as `@tab/db`, and a private database would have worked — but it would
+ * have put the graph's inputs somewhere a stranger cannot see, which
+ * contradicts the entire no-contract argument. Every other input to a ceiling
+ * is on a topic; the graph's inputs were the exception, and re-deriving them
+ * from an eventually-consistent index is precisely why `verify-ceiling` could
+ * check the arithmetic but never the graph.
+ *
+ * So they go on the topic. A published fact is durable, monotonic (see below),
+ * free of a database, and checkable by anyone with a Mirror Node URL.
+ *
+ * ## Monotonic, and why a reader must enforce it
+ *
+ * These messages are **append-only and cumulative**: once `by` is known for an
+ * account, a later message that omits it must NOT erase it. A reader that
+ * blindly takes the newest message would let one Mirror Node outage — which
+ * publishes a fact with no funder — wipe a funding edge that was correctly
+ * observed a week ago, reproducing the fail-open through the very mechanism
+ * meant to close it. `factsFromMessages` in `@tab/ledger` merges rather than
+ * replaces, and that is the load-bearing property.
+ *
+ * ## What is published, and what is not
+ *
+ * This is a **derived index of already-public data**: every field is readable
+ * by anyone from Mirror Node, and publishing it reveals no private
+ * information — it only saves the next reader from an index that may not
+ * answer. Nothing here is a private key, a request payload, or an amount.
+ */
+export const graphFact = base.extend({
+  t: z.literal('fact'),
+  /**
+   * The account this fact is ABOUT — not the tab.
+   *
+   * `base` carries `tab` because every other message concerns one, and here it
+   * means "the tab whose engine pass observed this". That is deliberate rather
+   * than a workaround: a fact is evidence someone gathered at a moment, and
+   * knowing which pass gathered it is what lets a reader re-run that pass.
+   */
+  acct: entityId,
+  /** Consensus timestamp of account creation. Absent when Mirror had none. */
+  born: consensusTimestamp.optional(),
+  /**
+   * The account that funded `acct`, when one was observed.
+   *
+   * Absent means NOT OBSERVED, never "has no funder" — an account genuinely
+   * created by itself is not a thing on Hedera. A reader must therefore treat
+   * absence as no information and keep whatever it already knew.
+   */
+  by: entityId.optional(),
+})
+
+/**
  * Every input that influenced the ceiling.
  *
  * If a number affected the result and is not in here, `verify-ceiling` cannot
@@ -202,7 +314,13 @@ export const ceilingUpdate = base.extend({
   /** SHA-256 of the canonical inputs. verify-ceiling recomputes and compares. */
   hash: shortHash,
   /** Why it moved, for the operator. Shrink is instant; growth waits. */
-  cause: z.enum(['clean_settlement', 'missed_settlement', 'graph_change', 'registration', 'freeze']),
+  cause: z.enum([
+    'clean_settlement',
+    'missed_settlement',
+    'graph_change',
+    'registration',
+    'freeze',
+  ]),
 })
 
 /* ── settlements topic ──────────────────────────────────────────────────── */
@@ -210,9 +328,18 @@ export const ceilingUpdate = base.extend({
 export const settlement = base.extend({
   t: z.literal('settlement'),
   credits: amount,
+  /**
+   * NEGATIVE, as `@tab/ledger`'s `WindowNet` holds it. So is `interest`.
+   *
+   * Stated because the comment below used to read `credits − debits −
+   * interest`, which describes positive magnitudes and is not what is
+   * published. A console built on that comment negated `debits`, turned a debit
+   * into a credit on screen, and showed a netting panel summing to 0.190000
+   * above a published net of 0.110000.
+   */
   debits: amount,
   interest: amount,
-  /** credits − debits − interest. One transfer for the whole window. */
+  /** credits + debits + interest, the latter two negative. One transfer per window. */
   net: amount,
   /** How many receipts collapsed into that one movement. */
   n: z.number().int().nonnegative(),
@@ -235,11 +362,27 @@ export const registration = base.extend({
   perCall: amount,
   /** Starter tabs may only buy from an allowlist until they graduate. */
   allowlist: z.array(entityId).max(16),
+  /**
+   * The agent's HCS-14 Universal Agent Identifier.
+   *
+   * Derived rather than issued: six canonical fields, SHA-384, Base58. Any
+   * party computes the same id from the same inputs, which is what lets a
+   * credit record travel between systems that do not know each other — today a
+   * tab is keyed on a Hedera account, so a redeployment starts from zero.
+   *
+   * OPTIONAL, and on the message that already exists rather than a new one. A
+   * reader that does not care ignores it, every registration published before
+   * it still decodes, and no ceiling, weight or settlement changes. Adding an
+   * identity should not be able to move a credit decision.
+   */
+  uaid: z.string().min(8).max(256).optional(),
 })
 
 /* ── the union written to any topic ─────────────────────────────────────── */
 
 export const tabMessage = z.discriminatedUnion('t', [
+  weightUpdate,
+  graphFact,
   holdReceipt,
   debitReceipt,
   creditReceipt,
@@ -254,6 +397,8 @@ export type DebitReceipt = z.infer<typeof debitReceipt>
 export type CreditReceipt = z.infer<typeof creditReceipt>
 export type RefusalReceipt = z.infer<typeof refusalReceipt>
 export type HoldReceipt = z.infer<typeof holdReceipt>
+export type WeightUpdate = z.infer<typeof weightUpdate>
+export type GraphFact = z.infer<typeof graphFact>
 export type RepairReceipt = z.infer<typeof repairReceipt>
 export type Receipt = z.infer<typeof receipt>
 export type CeilingInputs = z.infer<typeof ceilingInputs>

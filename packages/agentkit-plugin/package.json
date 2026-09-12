@@ -1,5 +1,5 @@
 {
-  "name": "@tab/protocol",
+  "name": "@tab/agentkit-plugin",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -13,8 +13,11 @@
     "test:unit": "node --experimental-strip-types --test src/*.test.ts"
   },
   "dependencies": {
+    "@hashgraph/hedera-agent-kit": "^4.0.0",
     "@tab/money": "workspace:*",
-    "zod": "catalog:"
+    "@tab/protocol": "workspace:*",
+    "@tab/sdk": "workspace:*",
+    "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
