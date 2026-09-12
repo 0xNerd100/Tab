@@ -1,9 +1,10 @@
 'use client'
 
-import { format } from '@/lib/money'
+import { Pill } from '@/components/ui'
 import { seq as fmtSeq } from '@/lib/format'
 import type { Receipt } from '@/lib/mock/types'
-import { Pill } from '@/components/ui'
+import { format } from '@/lib/money'
+import { TopicLink } from './topic-link'
 
 const COLS: [string, boolean][] = [
   ['Consensus', false],
@@ -43,9 +44,13 @@ export function ReceiptTable({ rows }: { rows: Receipt[] }) {
                   ? 'var(--credit)'
                   : 'var(--debit)'
             return (
-              <tr key={`${r.seq}-${r.consensus}`} data-flash={r.flash}>
+              // Keyed on the consensus timestamp, which is unique and always
+              // present. `seq` is absent until a receipt is published.
+              <tr key={r.consensus} data-flash={r.flash}>
                 <td style={{ color: 'var(--ink-2)', whiteSpace: 'nowrap' }}>{r.consensus}</td>
-                <td><Pill tone={tone}>{r.leg}</Pill></td>
+                <td>
+                  <Pill tone={tone}>{r.leg}</Pill>
+                </td>
                 <td>{r.counterparty}</td>
                 <td className="n" style={{ fontWeight: 600, color: amountColour }}>
                   {r.leg === 'REFUSED' ? format(r.amount) : format(r.amount, { sign: 'always' })}
@@ -53,11 +58,17 @@ export function ReceiptTable({ rows }: { rows: Receipt[] }) {
                 <td style={{ color: 'var(--ink-2)' }}>
                   {r.leg === 'REFUSED' ? '—' : r.attested ? 'yes' : 'no'}
                 </td>
-                <td style={{ color: 'var(--ink-3)' }}>{r.requestHash}</td>
+                <td style={{ color: 'var(--ink-3)' }}>{r.requestHash ?? '—'}</td>
                 <td className="n">
-                  <a href={`https://hashscan.io/testnet/topic/0.0.4881203`} style={{ color: 'var(--pen)' }}>
-                    {fmtSeq(r.seq)}
-                  </a>
+                  {/*
+                   * The receipts topic, read from the gateway rather than
+                   * hardcoded. This said `0.0.4881203` — a mock id that holds
+                   * no messages — so every sequence number on the busiest
+                   * table in the console linked to an empty topic.
+                   */}
+                  <TopicLink kind="receipts" style={{ color: 'var(--pen)' }}>
+                    {r.seq === undefined ? 'pending' : fmtSeq(r.seq)}
+                  </TopicLink>
                 </td>
               </tr>
             )

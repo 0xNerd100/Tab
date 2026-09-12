@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { SEARCH_INDEX } from '@/lib/mock/docs'
+import { SEARCH_INDEX } from '@/lib/docs'
 
 /** ⌘K. The only animation in the docs, and it opens on `snap`. */
 export function SearchPalette() {
@@ -30,17 +30,41 @@ export function SearchPalette() {
         <span style={{ color: 'var(--ink-2)' }}>⌘K</span>
       </button>
 
+      {/*
+        The scrim is a BACKDROP, not the dialog. `role="dialog"` used to sit on
+        the full-screen click-to-close layer, so a screen reader was told the
+        backdrop was the dialog and the palette inside it was just content. The
+        roles now sit where the elements actually are.
+
+        Escape is handled by a window listener above, which a linter cannot see;
+        the `onKeyDown` here is the same behaviour bound to the element, so the
+        click target is genuinely keyboard-reachable rather than merely asserted
+        to be.
+      */}
       {open ? (
-        <div
-          className="palette-scrim"
-          onClick={() => setOpen(false)}
-          role="dialog"
-          aria-modal="true"
-          aria-label="Search the docs"
-        >
-          <div className="palette" onClick={(e) => e.stopPropagation()}>
+        <div className="palette-scrim">
+          {/*
+            A real <button> for the backdrop, not a div with a click handler.
+            Click-to-dismiss has to be reachable by keyboard and announced, and
+            a button is the element that already is both — where a div needs a
+            role, a tabindex and a key handler bolted on to imitate one.
+            `aria-label` because it has no visible text.
+          */}
+          <button
+            type="button"
+            className="palette-scrim-dismiss"
+            aria-label="Close search"
+            onClick={() => setOpen(false)}
+          />
+          <div
+            className="palette"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Search the docs"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
             <input
-              autoFocus
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -54,10 +78,28 @@ export function SearchPalette() {
                 </div>
               ) : (
                 results.map((r) => (
-                  <div key={r.title} className="palette-row">
-                    <span className="t-label" style={{ width: 110, flex: 'none' }}>{r.section}</span>
+                  /*
+                   * An anchor, not a div.
+                   *
+                   * Every result used to be inert: the palette found things and
+                   * then could not take you to them, which is a worse
+                   * experience than having no search at all — it looks like the
+                   * page is broken rather than absent. Each entry now carries
+                   * the anchor it describes, and selecting one closes the
+                   * palette on the way.
+                   */
+                  <a
+                    key={r.href}
+                    href={r.href}
+                    className="palette-row"
+                    onClick={() => setOpen(false)}
+                    style={{ color: 'inherit', textDecoration: 'none', cursor: 'pointer' }}
+                  >
+                    <span className="t-label" style={{ width: 110, flex: 'none' }}>
+                      {r.section}
+                    </span>
                     <span style={{ fontSize: 14 }}>{highlight(r.title, q)}</span>
-                  </div>
+                  </a>
                 ))
               )}
             </div>
