@@ -34,7 +34,6 @@ Built for ETHOnline 2026 · Hedera Testnet · **Zero Solidity**
 - [Attack Catalogue](#attack-catalogue)
 - [What We Deliberately Did Not Build](#what-we-deliberately-did-not-build)
 - [Roadmap](#roadmap)
-- [Demo](#demo)
 
 ---
 
