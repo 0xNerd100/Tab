@@ -20,6 +20,31 @@ export interface EntryBase {
   at: ConsensusTimestamp
   /** Which settlement window this belongs to. */
   window: number
+  /**
+   * The token this entry's amounts are denominated in.
+   *
+   * Optional only because receipts written before the `tok` field existed do
+   * not carry it. **An absent token cannot be assumed to be the current one** —
+   * that is precisely the bug this exists to prevent: a deployment that
+   * switched tokens would leave one topic holding amounts in two currencies,
+   * and anything summing them would be adding TUSD to USDC and reporting the
+   * total as money.
+   *
+   * A consumer asserting a balance MUST filter on this and report what it
+   * excluded, the way `verify-tab` does.
+   */
+  token?: string
+  /**
+   * The HCS sequence number this entry was replayed from.
+   *
+   * Optional because an entry constructed in-process — before its receipt is
+   * published — genuinely has no sequence number yet. Present on anything
+   * replayed from a topic, and it is the number you cite in an audit, so the
+   * console shows it rather than a counter of its own.
+   */
+  seq?: number
+  /** Hash of the request this entry relates to, when the receipt carried one. */
+  requestHash?: string
 }
 
 /**
@@ -110,6 +135,29 @@ export interface SettlementEntry extends EntryBase {
    */
   rampFromBp: number
   rampToBp: number
+  /**
+   * The gross legs the net collapsed from, and how many receipts collapsed.
+   *
+   * On the entry rather than in a second decoder because the console's
+   * settlements view exists to show ONE claim: many receipts became one
+   * transfer. Showing only `net` shows the transfer and hides the netting,
+   * which is the part worth proving — and a parallel `settlementsFromMessages`
+   * would be a fourth private replay copy, the exact mistake that lost holds on
+   * every gateway restart.
+   *
+   * Optional because settlements published before these fields existed decode
+   * without them. A reader must treat absent as unknown, NOT as zero: a
+   * settlement whose credits are genuinely 0.000000 and one that never recorded
+   * its credits are different facts, and rendering both as `0.0000` invents
+   * a netting that was never published.
+   */
+  credits?: MicroUsdc
+  debits?: MicroUsdc
+  interest?: MicroUsdc
+  /** How many receipts collapsed into the one movement. */
+  receiptCount?: number
+  /** Carried into the next window when net is negative. */
+  outstanding?: MicroUsdc
 }
 
 export type Entry =
