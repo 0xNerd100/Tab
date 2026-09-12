@@ -22,19 +22,28 @@
  * the transparency claim holds today and the persistence layer is a performance
  * story, which is the right order to build them in.
  */
+
+import { type AccountFacts, type AccountId, fundingRoot, WEIGHT_REASON_DETAIL } from '@tab/graph'
 import { clientFromEnv } from '@tab/hedera'
-import { MirrorClient, configureGlobalHttp } from '@tab/mirror'
-import { bp, format, formatBpMultiple, formatBpPercent, usdc } from '@tab/money'
-import { MODEL_ID, describeParams, params, windowOf } from '@tab/params'
-import { ceilingsFromMessages, checkWindowSettledOnce, rampAfter, type Entry } from '@tab/ledger'
-import { WEIGHT_REASON_DETAIL, type AccountFacts, type AccountId } from '@tab/graph'
 import {
-  entriesFromMessages, readTopic, reassembleChunks,
-} from './replay.ts'
-import { edgesFor, funderOf, isYoung, revenueFromEntries } from './gather.ts'
-import { recompute } from './recompute.ts'
+  ceilingsFromMessages,
+  factsFromMessages,
+  rampAfter,
+  registrationsFromMessages,
+  starterGrantFor,
+} from '@tab/ledger'
+import { configureGlobalHttp, MirrorClient } from '@tab/mirror'
+import { bp, format, formatBpMultiple, formatBpPercent, usdc } from '@tab/money'
+import { caps, describeParams, MODEL_ID, params, windowOf } from '@tab/params'
+import { resolveAncestry } from './ancestry.ts'
+import { edgesFor, isYoungFrom, observeAccount, revenueFromEntries } from './gather.ts'
+import { type CeilingState, transition } from './guards/asymmetry.ts'
 import { publishCeiling } from './publish/ceiling.ts'
-import { transition, type CeilingState } from './guards/asymmetry.ts'
+import { type ObservedFact, publishFacts } from './publish/facts.ts'
+import { publishRegistration } from './publish/registration.ts'
+import { publishWeights } from './publish/weights.ts'
+import { recompute } from './recompute.ts'
+import { entriesFromMessages, readTopic, reassembleChunks } from './replay.ts'
 
 configureGlobalHttp({ connectTimeoutMs: 60_000 })
 
@@ -64,7 +73,12 @@ const windowSeconds = demoMode
 const TRAILING_WINDOWS = Number(process.env['TRAILING_WINDOWS'] ?? 6)
 
 const hedera = clientFromEnv()
-const mirror = new MirrorClient({ network: hedera.network, timeoutMs: 45_000, maxRetries: 4, maxPages: 12 })
+const mirror = new MirrorClient({
+  network: hedera.network,
+  timeoutMs: 45_000,
+  maxRetries: 4,
+  maxPages: 12,
+})
 
 /*
  * The ceiling state lives in this process for now.
@@ -98,6 +112,19 @@ async function pass(): Promise<void> {
 
   const receipts = await replayTopic(receiptTopic)
   const settlements = await replayTopic(settlementTopic)
+
+  /*
+   * The ceiling topic, read ONCE per pass and used three ways.
+   *
+   * Remembered graph facts (the fail-open fix), the in-force ceiling to resume
+   * on a cold start, and the check on what is worth republishing. It was read
+   * lazily inside the cold-start branch before; facts are needed on every pass,
+   * and reading the same topic twice in one pass would give two readers a
+   * chance to disagree about it.
+   */
+  const ceilingMessages = reassembleChunks(
+    (await readTopic(mirror, { topicId: ceilingTopic })).items,
+  ).assembled
   const entries = [
     ...(receipts.byTab.get(tabAccount) ?? []),
     ...(settlements.byTab.get(tabAccount) ?? []),
@@ -106,7 +133,9 @@ async function pass(): Promise<void> {
   const revenue = revenueFromEntries(entries, TRAILING_WINDOWS, currentWindow)
 
   const settlementEntries = entries.filter((e) => e.kind === 'settlement')
-  const hasDefaulted = settlementEntries.some((e) => e.kind === 'settlement' && e.outcome === 'missed')
+  const hasDefaulted = settlementEntries.some(
+    (e) => e.kind === 'settlement' && e.outcome === 'missed',
+  )
 
   // Consecutive clean settlements, counted from the most recent backwards. A
   // total count would let an old good history outweigh a recent miss.
@@ -119,8 +148,10 @@ async function pass(): Promise<void> {
 
   const counterparties = [...revenue.revenueByCounterparty.keys()]
 
-  console.log(`\n  window ${currentWindow} · ${revenue.history.length} closed window(s) of revenue · ` +
-    `${counterparties.length} counterparty(ies)`)
+  console.log(
+    `\n  window ${currentWindow} · ${revenue.history.length} closed window(s) of revenue · ` +
+      `${counterparties.length} counterparty(ies)`,
+  )
 
   /*
    * Funding ancestry, one hop per counterparty.
@@ -134,6 +165,35 @@ async function pass(): Promise<void> {
    */
   const facts = new Map<AccountId, AccountFacts>()
   const young = new Set<AccountId>()
+
+  /*
+   * What the topic already remembers.
+   *
+   * Read once per pass and used two ways: as the FALLBACK when Mirror Node
+   * cannot answer, and as the check on what is worth publishing. The reader is
+   * monotonic — a fact with no funder cannot erase a known one — which is the
+   * property the whole fix rests on. See `factsFromMessages`.
+   */
+  const remembered = factsFromMessages(ceilingMessages)
+  if (remembered.conflicts.length > 0) {
+    /*
+     * Never expected: an account has exactly one creating payer, forever.
+     *
+     * Reported rather than resolved. Two different answers means either a bug
+     * in whatever published, or a writer on this topic who should not be — and
+     * silently taking one would hide both.
+     */
+    for (const c of remembered.conflicts) {
+      console.log(
+        `    CONFLICT  ${c.account} was published as funded by both ${c.kept} and ${c.rejected}; ` +
+          `keeping the first observation (${c.kept})`,
+      )
+    }
+  }
+
+  /** Everything this pass actually saw, for the publisher to diff. */
+  const observed: ObservedFact[] = []
+  const stats = { fetched: 0, remembered: 0, unknown: 0 }
 
   /*
    * The TAB's own ancestry, which was missing.
@@ -157,46 +217,109 @@ async function pass(): Promise<void> {
    * Memoised across the pass: the whole point of an ancestry walk is that
    * accounts share ancestors, so the same funder gets asked for repeatedly.
    */
-  const resolved = new Set<AccountId>()
-  async function walkAncestry(account: AccountId, hopsLeft: number): Promise<void> {
-    if (hopsLeft <= 0 || resolved.has(account)) return
-    resolved.add(account)
-    try {
-      const funder = await funderOf(mirror, account)
-      facts.set(account, { id: account, ...(funder ? { fundedBy: [funder] } : {}) })
-      if (funder) await walkAncestry(funder, hopsLeft - 1)
-    } catch (error) {
-      /*
-       * FAILS OPEN, and says so.
-       *
-       * An account whose ancestry cannot be fetched is treated as having none,
-       * which weights it as independent — the unsafe direction. It is named
-       * here rather than buried because the fix is a persisted graph
-       * (`@tab/db`), not more retries: a security rule that fails open must not
-       * depend on re-deriving its inputs from an eventually-consistent index.
-       */
-      facts.set(account, { id: account })
-      console.log(
-        `    WARNING  ancestry for ${account} unavailable ` +
-          `(${error instanceof Error ? error.message : String(error)}) — treated as independent`,
-      )
-    }
-  }
+  /*
+   * The walk lives in `ancestry.ts` so it can be TESTED.
+   *
+   * It was inline here, and the branch that matters most — Mirror Node
+   * unavailable, the topic answering instead — is the branch a live run is
+   * least likely to exercise, because Mirror usually works. A security rule
+   * that fails open should not be trusted on a coincidence.
+   *
+   * The tab is walked first so its own ancestry is in `facts` before any
+   * counterparty is compared against it. Without an entry for the tab,
+   * `sharedFundingRoot(tab, counterparty, ...)` returns false every time — the
+   * tab simply is not in the map — which made the shared-root discount and the
+   * common-funder block both structurally impossible. Neither rule was wrong;
+   * neither was ever asked.
+   */
+  const ancestry = await resolveAncestry([tabAccount, ...counterparties], {
+    observe: (account) => observeAccount(mirror, account),
+    remembered: remembered.byAccount,
+    hops: params.fundingAncestryHops,
+    note: (line) => console.log(line),
+  })
+  for (const [id, fact] of ancestry.facts) facts.set(id, fact)
+  observed.push(...ancestry.observed)
+  stats.fetched = ancestry.stats.fetched
+  stats.remembered = ancestry.stats.remembered
+  stats.unknown = ancestry.stats.unknown
 
-  await walkAncestry(tabAccount, params.fundingAncestryHops)
   const tabFunder = facts.get(tabAccount)?.fundedBy?.[0]
   if (tabFunder) console.log(`    tab funded by ${tabFunder}`)
 
   for (const counterparty of counterparties) {
-    await walkAncestry(counterparty, params.fundingAncestryHops)
-    try {
-      if ((await isYoung(mirror, counterparty, nowSeconds)) === true) young.add(counterparty)
-    } catch {
+    /*
+     * The age comes from the birth time the walk already has.
+     *
+     * `isYoung` made its OWN `getAccount` call, so every counterparty cost two
+     * identical account fetches per pass — and, worse, the two answers could
+     * disagree: one call could succeed and the other fail, giving an account a
+     * funder but no age, or the reverse. One observation now answers both
+     * questions, and it falls back to the remembered birth time exactly as the
+     * ancestry does.
+     */
+    const age = isYoungFrom(ancestry.birthdays.get(counterparty), nowSeconds)
+    if (age === true) young.add(counterparty)
+    else if (age === undefined) {
       // An unknown age is not "old enough". Left out of `young` means no age
-      // discount, which is the unsafe direction — recorded alongside the
-      // ancestry fail-open above rather than treated as different.
-      console.log(`    WARNING  age for ${counterparty} unavailable — no age discount applied`)
+      // discount, which is the unsafe direction — the same residual as the
+      // ancestry case, and named the same way rather than treated as different.
+      console.log(
+        `    WARNING  age for ${counterparty} unknown (not fetched, not published) — ` +
+          `no age discount applied (FAILS OPEN)`,
+      )
     }
+  }
+
+  /*
+   * The unverifiable counterparties, named on their own line.
+   *
+   * `stats.unknown` counts accounts the WALK could not resolve, which includes
+   * ancestors nobody is being weighted on. This counts the ones that actually
+   * cost something: a counterparty contributing revenue whose provenance we
+   * cannot establish, and which v3 therefore discounts rather than trusts.
+   */
+  const unverifiedCounterparties = counterparties.filter((c) => ancestry.unverified.has(c))
+
+  console.log(
+    `    ancestry    ${stats.fetched} fetched · ${stats.remembered} from the topic · ` +
+      `${stats.unknown} unresolved`,
+  )
+  if (unverifiedCounterparties.length > 0) {
+    const step = params.weights?.unverifiedBp
+    console.log(
+      `    UNVERIFIED  ${unverifiedCounterparties.length} counterparty(ies) with no published ` +
+        `provenance — discounted to ${step !== undefined ? `${step / 100}%` : 'full weight (pre-v3 set)'}: ` +
+        unverifiedCounterparties.join(', '),
+    )
+  }
+
+  /*
+   * ── the Starter Tab claim ────────────────────────────────────────────────
+   *
+   * One Starter Tab per funding root. The root comes from the PUBLISHED facts
+   * the walk just resolved, so the rule keys on something a stranger can check
+   * rather than on whether an operator remembered to register — an attacker
+   * would simply not register, and a rule keyed on registration presence
+   * defends against nothing.
+   */
+  const registrations = registrationsFromMessages(ceilingMessages)
+  const root = fundingRoot(tabAccount, facts, params.fundingAncestryHops)
+  const grant = starterGrantFor(tabAccount, root?.root, registrations)
+
+  console.log(
+    `    root        ${root ? `${root.root} (${root.hops} hop(s))` : 'unresolved'} · ` +
+      `starter grant ${grant.status}` +
+      (grant.status === 'taken' ? ` — held by ${grant.heldBy} (seq ${grant.seq ?? '?'})` : '') +
+      (grant.seq !== undefined && grant.status === 'granted'
+        ? ` (claimed at seq ${grant.seq})`
+        : ''),
+  )
+  if (grant.status === 'taken') {
+    console.log(
+      `    NO STARTER FLOOR — another tab already holds the claim on ${root?.root}. ` +
+        'This tab must earn its ceiling from independent revenue.',
+    )
   }
 
   const edges = await edgesFor(
@@ -215,6 +338,8 @@ async function pass(): Promise<void> {
     attestedCounterparties: revenue.attestedCounterparties,
     revenueByCounterparty: revenue.revenueByCounterparty,
     young,
+    unverified: ancestry.unverified,
+    starterGrant: grant.status,
     rampBp: rampAfter(entries),
     cleanStreak,
     hasDefaulted,
@@ -256,9 +381,7 @@ async function pass(): Promise<void> {
    * of what is in force, so it is the right thing to resume from.
    */
   if (!ceilingState) {
-    const published = ceilingsFromMessages(
-      reassembleChunks((await readTopic(mirror, { topicId: ceilingTopic })).items).assembled,
-    ).get(tabAccount)
+    const published = ceilingsFromMessages(ceilingMessages).get(tabAccount)
     if (published) {
       ceilingState = { inForce: published.ceiling, window: published.window }
       console.log(
@@ -287,6 +410,111 @@ async function pass(): Promise<void> {
    * and an engine that only speaks when a number moves is indistinguishable
    * from one that has died.
    */
+  /*
+   * Weights first, then the ceiling.
+   *
+   * The ceiling is the CONCLUSION and the weights are the evidence for it, so a
+   * reader who sees a ceiling on the topic can already find the weights that
+   * produced it. Published the other way round there is a window — small, but
+   * real — where the console shows a collapsed ceiling and no reason for it,
+   * which is the one thing the Counterparties view exists to prevent.
+   */
+  /*
+   * Facts first, then weights, then the ceiling — evidence before conclusion.
+   *
+   * A fact is the evidence for a weight, and a weight is the evidence for the
+   * ceiling, so a reader who finds a ceiling on the topic can always walk back
+   * to what produced it. Published the other way round there is a window —
+   * small, but real — in which the record carries a conclusion whose reasons
+   * have not landed yet.
+   *
+   * Only NEW facts are written. The reader is monotonic, so a duplicate is
+   * harmless, but republishing every account every window would add N messages
+   * per window forever to say nothing.
+   */
+  /*
+   * Claim the root FIRST, before anything else this pass writes.
+   *
+   * The claim is a race that only one tab can win, and the winner is decided by
+   * consensus order — so publishing it after the weights and the ceiling would
+   * widen the window in which two concurrently-running engines both see the
+   * root as free. It cannot close that window entirely (see the ceiling
+   * serialisation gap), but it should not be made wider for no reason.
+   *
+   * Only when the root is UNCLAIMED. `granted` with a seq means this tab
+   * already holds it, and re-claiming would add a message per window forever to
+   * say something the topic already says.
+   */
+  /*
+   * Publish when the root is UNCLAIMED, or when the claim we already hold
+   * predates the HCS-14 identifier.
+   *
+   * Without the second condition a tab that registered before HCS-14 existed
+   * would never carry an identity — its root is already claimed, so the first
+   * condition is false forever. Re-registering is safe by construction:
+   * `registrationsFromMessages` updates `byTab` but leaves `byRoot` with the
+   * FIRST claim, so an upgrade cannot steal a root from anyone.
+   *
+   * Self-terminating: once the published registration carries a `uaid`, the
+   * replay sees it and this stops firing. No republish loop.
+   */
+  const heldRegistration = registrations.byTab.get(tabAccount)
+  const needsIdentity = grant.status === 'granted' && heldRegistration?.uaid === undefined
+
+  if (root && grant.status === 'granted' && (grant.seq === undefined || needsIdentity)) {
+    const claimed = await publishRegistration({
+      hedera,
+      topicId: ceilingTopic,
+      tab: tabAccount,
+      window: currentWindow,
+      root: root.root,
+      starterCeiling: caps.starterCeiling,
+      perCallCap: caps.perCall,
+    })
+    if (claimed) {
+      console.log(
+        `  registration    ${grant.seq === undefined ? 'claimed' : 'upgraded'} root ${claimed.root} · ` +
+          `seq ${claimed.sequenceNumber} — one Starter Tab per funding root` +
+          (needsIdentity ? ' · now carrying an HCS-14 identity' : ''),
+      )
+    }
+  }
+
+  const factSeqs = await publishFacts({
+    hedera,
+    topicId: ceilingTopic,
+    tab: tabAccount,
+    window: currentWindow,
+    observed,
+    known: remembered.byAccount,
+  })
+  if (factSeqs.length > 0) {
+    console.log(
+      `  facts           ${factSeqs.length} published · ` +
+        factSeqs.map((f) => `${f.account} (${f.added}) seq ${f.sequenceNumber}`).join(', '),
+    )
+  } else {
+    console.log(
+      `  facts           none new — the topic already knows ${remembered.byAccount.size} account(s)`,
+    )
+  }
+
+  if (result.weights.length > 0) {
+    const weightSeqs = await publishWeights({
+      hedera,
+      topicId: ceilingTopic,
+      tab: tabAccount,
+      window: currentWindow,
+      tokenId,
+      modelId: MODEL_ID,
+      weights: result.weights,
+      revenue: revenue.revenueByCounterparty,
+    })
+    console.log(
+      `  weights         ${weightSeqs.length} published · seq ${weightSeqs.map((w) => w.sequenceNumber).join(', ')}`,
+    )
+  }
+
   const published = await publishCeiling({
     hedera,
     topicId: ceilingTopic,
@@ -299,6 +527,7 @@ async function pass(): Promise<void> {
     inForce: move.next.inForce,
     cause: move.action === 'shrink_now' ? 'graph_change' : 'clean_settlement',
     modelId: MODEL_ID,
+    tokenId,
   })
 
   console.log(`
@@ -315,9 +544,13 @@ console.log(`  tab             ${tabAccount}`)
 console.log(`  token           ${tokenId}`)
 console.log(`  ceiling topic   ${ceilingTopic}`)
 console.log(`  trailing        ${TRAILING_WINDOWS} window(s)`)
-console.log(`  mode            ${once ? 'single pass' : 'loop'}${publish ? ' · PUBLISHING' : ' · dry'}`)
+console.log(
+  `  mode            ${once ? 'single pass' : 'loop'}${publish ? ' · PUBLISHING' : ' · dry'}`,
+)
 if (demoMode && windowSeconds !== params.window.seconds) {
-  console.log(`  window          ${windowSeconds}s  (DEMO_MODE override of params' ${params.window.seconds}s)`)
+  console.log(
+    `  window          ${windowSeconds}s  (DEMO_MODE override of params' ${params.window.seconds}s)`,
+  )
 }
 console.log()
 for (const line of describeParams()) console.log(`  ${line}`)

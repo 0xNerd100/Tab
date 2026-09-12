@@ -8,34 +8,68 @@
  * bookkeeping — deciding which counterparties to ask about, and assembling the
  * published input record.
  */
-import { micro, type MicroUsdc } from '@tab/money'
-import { MODEL_ID, caps, params, tierMultipleBpFor, type Tier } from '@tab/params'
+
 import {
-  applyWeight, concentration, sharedFundingRoot, weightOf,
-  type AccountFacts, type AccountId, type TransferEdge, type Weight, type WeightPolicy,
+  type AccountFacts,
+  type AccountId,
+  applyWeight,
+  concentration,
+  sharedFundingRoot,
+  type TransferEdge,
+  type Weight,
+  type WeightPolicy,
+  weightOf,
 } from '@tab/graph'
+import { type MicroUsdc, micro } from '@tab/money'
+import { caps, MODEL_ID, params, type Tier, tierMultipleBpFor } from '@tab/params'
 import {
-  computeCeiling, effectiveRevenue, tierOf,
-  type CeilingInputs, type CeilingResult, type WindowRevenue,
+  type CeilingInputs,
+  type CeilingResult,
+  computeCeiling,
+  effectiveRevenue,
+  tierOf,
+  type WindowRevenue,
 } from '@tab/scoring'
 
 /**
- * Discount steps.
+ * Discount steps, FROM THE FROZEN PARAMETER SET.
  *
- * These live here rather than in `@tab/params` for now, and that is a gap worth
- * naming rather than hiding: they influence a published ceiling, so by the rule
- * this project set itself they belong in the versioned parameter set where
- * `verify-ceiling` can find them. Moving them is a params version bump, which
- * is exactly the ceremony that rule exists to impose.
+ * These were hardcoded here, and the comment that used to sit in this spot said
+ * why that was wrong: *"they influence a published ceiling, so by the rule this
+ * project set itself they belong in the versioned parameter set where
+ * verify-ceiling can find them. Moving them is a params version bump, which is
+ * exactly the ceremony that rule exists to impose."*
+ *
+ * v3 is that bump. The consequence is not cosmetic: a weight message says
+ * `bp 3360 · why [SHARED_FUNDING_ROOT, YOUNG_ACCOUNT, CONCENTRATED]`, and until
+ * the steps were in the frozen set no stranger could check that 3360 follows
+ * from those reasons. Now they can — 0.7 × 0.6 × 0.8 = 0.336.
+ *
+ * Throws on a pre-v3 set rather than falling back to the old constants. A
+ * fallback would let the engine keep running on numbers that are not in the
+ * record, which is the exact condition this move exists to end.
  */
-export const WEIGHT_POLICY: WeightPolicy = {
-  reciprocalBp: 5000,
-  reciprocalThresholdBp: 2500,
-  sharedRootBp: 7000,
-  youngBp: 6000,
-  concentratedBp: 8000,
-  unattestedBp: params.unattestedDiscountBp,
-}
+export const WEIGHT_POLICY: WeightPolicy = (() => {
+  const frozen = params.weights
+  if (!frozen) {
+    throw new Error(
+      `Parameter set v${params.version} carries no weight policy. The engine must not ` +
+        'fall back to hardcoded discount steps: a published weight has to be reproducible ' +
+        'from the frozen set, and numbers that live only in this file are not.',
+    )
+  }
+  return {
+    reciprocalBp: frozen.reciprocalBp,
+    reciprocalThresholdBp: frozen.reciprocalThresholdBp,
+    sharedRootBp: frozen.sharedRootBp,
+    youngBp: frozen.youngBp,
+    concentratedBp: frozen.concentratedBp,
+    unverifiedBp: frozen.unverifiedBp,
+    // Top-level in the set, not inside `weights` — it predates the block and
+    // is referenced by the ceiling formula too, so it stays where it was.
+    unattestedBp: params.unattestedDiscountBp,
+  }
+})()
 
 export interface RecomputeInputs {
   tab: AccountId
@@ -46,10 +80,32 @@ export interface RecomputeInputs {
   revenueByCounterparty: ReadonlyMap<AccountId, MicroUsdc>
   /** Accounts known to be younger than the age threshold. */
   young: ReadonlySet<AccountId>
+  /**
+   * Accounts whose funding provenance was neither observed NOR published.
+   *
+   * The funding rules could not be evaluated against these, so they are
+   * discounted rather than trusted. Optional so a caller that does not track it
+   * behaves exactly as before — but the engine always passes it, because
+   * treating an unverifiable counterparty as independent is the failure that let
+   * the loop attacker through on its first full run.
+   */
+  unverified?: ReadonlySet<AccountId>
   /** Ramp in force, basis points, from the settlement history. */
   rampBp: number
   cleanStreak: number
   hasDefaulted: boolean
+  /**
+   * Whether this tab holds the Starter Tab claim on its funding root.
+   *
+   * `taken` means another tab already claimed it, so the starter floor is zero
+   * — one Starter Tab per funding root is what makes bulk-minting agents
+   * pointless. `unknown` (no root resolved) GRANTS the floor, because refusing
+   * would let an indexer outage stop every new agent from ever starting, and
+   * `UNVERIFIED_FUNDING` already discounts what such a tab earns.
+   *
+   * Optional so a caller that does not resolve roots behaves exactly as before.
+   */
+  starterGrant?: 'granted' | 'taken' | 'unknown'
   /** Trailing windows to average revenue over. */
   windowCount: number
   hardCap: MicroUsdc
@@ -83,7 +139,12 @@ export function recompute(inputs: RecomputeInputs): Recomputation {
    */
   const weights: Weight[] = []
   for (const counterparty of inputs.revenueByCounterparty.keys()) {
-    const shared = sharedFundingRoot(inputs.tab, counterparty, inputs.facts, params.fundingAncestryHops)
+    const shared = sharedFundingRoot(
+      inputs.tab,
+      counterparty,
+      inputs.facts,
+      params.fundingAncestryHops,
+    )
     weights.push(
       weightOf({
         agent: inputs.tab,
@@ -95,6 +156,7 @@ export function recompute(inputs: RecomputeInputs): Recomputation {
         concentrated: overCap.has(counterparty),
         sharedRoot: shared.shared,
         young: inputs.young.has(counterparty),
+        unverified: inputs.unverified?.has(counterparty) === true,
         // Attestation is per-RECEIPT, not per-counterparty, and it is already
         // applied by the unattested discount inside effectiveRevenue. Applying
         // it again here would discount the same weakness twice.
@@ -151,12 +213,25 @@ export function recompute(inputs: RecomputeInputs): Recomputation {
     multipleBp: tierMultipleBpFor(tier.tier),
     rampBp: inputs.rampBp,
     hardCap: inputs.hardCap,
-    // `caps.starterCeiling` is already parsed money. Re-parsing the string
-    // form by stripping the decimal point would work today and break silently
-    // the moment a cap is written with a different number of decimals.
-    // The floor applies to a new tab too. Withholding it from Unrated made a
-    // new agent unable to ever start — see computeCeiling.
-    starterFloor: caps.starterCeiling,
+    /*
+     * The starter floor is granted ONCE PER FUNDING ROOT.
+     *
+     * `caps.starterCeiling` is already parsed money. Re-parsing the string form
+     * by stripping the decimal point would work today and break silently the
+     * moment a cap is written with a different number of decimals.
+     *
+     * The floor applies to a new tab too — withholding it from Unrated made a
+     * new agent unable to ever start, see `computeCeiling`. But it is a GRANT,
+     * and a grant handed out per-account is a grant an attacker mints accounts
+     * to farm. When another tab already holds the claim on this tab's funding
+     * root, the floor is zero and this tab must earn its ceiling from
+     * independent revenue like any other.
+     *
+     * Zero rather than a refusal, deliberately: the tab still works, still
+     * spends what it earns, and still settles. It is denied the free headroom,
+     * not the rail.
+     */
+    starterFloor: inputs.starterGrant === 'taken' ? micro(0n) : caps.starterCeiling,
     hasDefaulted: inputs.hasDefaulted,
   }
 
