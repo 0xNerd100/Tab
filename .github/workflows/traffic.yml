@@ -1,0 +1,316 @@
+# Keep the topic alive.
+#
+# The engine publishes ceilings and the settlement worker closes windows, but
+# neither creates RECEIPTS — those only exist when an agent actually spends or
+# earns. Without this, every receipt on the topic came from someone running a
+# script by hand, so the console showed "0 rows" to anyone who looked between
+# demos, and the ceiling sat at the starter floor because trailing revenue was
+# always zero.
+#
+# A credit rail with no traffic cannot demonstrate credit. This is the traffic.
+#
+# It runs the SAME path a visitor takes: a plain seller URL with no price and no
+# counterparty, because both belong to the seller. A generator that took a
+# private shortcut would keep passing while the real path was broken — which is
+# exactly what happened before.
+
+name: traffic
+
+on:
+  schedule:
+    # Every 30 minutes — and the previous value of every 10 was a mistake worth
+    # recording, because it failed in a way that looked like nothing.
+    #
+    # GitHub delays scheduled runs under load and drops high-frequency ones
+    # first. At 6 runs an hour this workflow never fired on schedule ONCE, and
+    # the repo's other schedules — engine and settle, which had been reliable —
+    # stopped with it: engine ran 25 minutes late, then not at all; settle 32
+    # minutes late, then not at all. Nothing was disabled and no quota was
+    # touched (152 of 3,000 minutes). The queue was simply being throttled.
+    #
+    # So this is not a keep-warm mechanism and must not be treated as one. It
+    # exists to put receipts on the topic. Render suspends after 15 minutes
+    # idle, which no cadence GitHub will honour can stay ahead of — warmth needs
+    # something that actually runs on time, an external pinger or a hand on the
+    # keyboard before a demo.
+    #
+    # Offset off :00 so it never lands on the engine (:17) or settle (:47).
+    - cron: '3,33 * * * *'
+  workflow_dispatch:
+    inputs:
+      calls:
+        description: 'Spend attempts this run'
+        required: false
+        default: '4'
+
+# One run at a time. Two concurrent generators would interleave holds against
+# the same ceiling and make the ledger harder to read for no extra evidence.
+concurrency:
+  group: traffic
+  cancel-in-progress: false
+
+jobs:
+  spend:
+    runs-on: ubuntu-latest
+    # Free-tier services sleep; a cold start plus four x402 settlements at
+    # ~5s each needs room, but not unbounded room.
+    # Wake (up to ~75s a service), four spends, one top-up. The earn leg is a
+    # separate parallel job now and carries its own timeout.
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.20.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Render suspends idle services and takes ~50s to wake. Waking them
+      # BEFORE the run means the first spend is not racing a cold start, and a
+      # service that never wakes fails here with a clear message rather than as
+      # a mysterious timeout mid-purchase.
+      #
+      # ALL THREE, and the third one was missing. The agent endpoint is what
+      # the earn leg serves from, and while it slept every earn call came back
+      #
+      #   HTTP 502  {"served":null,"credited":{...,"attested":false}}
+      #
+      # The payment settled and the credit was written — but nothing was served,
+      # so the gateway could not attest it, and an unattested credit takes the
+      # 60% discount. The run reported "0 of 55 paid" (the payer counts 200s)
+      # while the balance climbed anyway, which is about as confusing as a log
+      # line can be.
+      - name: Wake the services
+        run: |
+          for url in "${{ vars.TAB_GATEWAY_URL }}" "${{ vars.SELLER_URL }}" \
+                     "${{ vars.AGENT_ENDPOINT_URL }}"; do
+            echo "waking $url"
+            curl -sS --max-time 90 --retry 3 --retry-all-errors "$url/health" || {
+              echo "::error::$url did not answer /health"; exit 1; }
+            echo
+          done
+
+      - name: Spend against the seller
+        run: pnpm demo:honest
+        env:
+          TAB_GATEWAY_URL: ${{ vars.TAB_GATEWAY_URL }}
+          SELLER_URL: ${{ vars.SELLER_URL }}
+          DEMO_CALLS: ${{ inputs.calls || '4' }}
+          # Which tab the receipts are filed against — the agent the console
+          # displays, not the operator account that happens to fund it.
+          TAB_ACCOUNT_ID: ${{ secrets.TAB_ACCOUNT_ID }}
+          HEDERA_OPERATOR_ID: ${{ secrets.HEDERA_OPERATOR_ID }}
+          USDC_TOKEN_ID: ${{ secrets.USDC_TOKEN_ID }}
+
+      # Move tokens back to the start of the loop when the payer runs low.
+      #
+      # `/v1/earn` pays TO the operator, so operator -> payer -> earn -> operator
+      # is a circuit and this returns the same tokens to the front of it. Testnet
+      # USDC cannot be minted — it is treasuried at 0.0.5176, not by us — so
+      # recycling is the only thing keeping this alive past a few hours.
+      #
+      # Threshold-guarded: above the floor it moves nothing and costs a mirror
+      # read. Best-effort because a failed top-up still leaves the payer with
+      # whatever it had, and the earn step below will say so loudly if that is
+      # not enough.
+      - name: Top up the demo payer
+        continue-on-error: true
+        # Target 6, floor 2.5, PER customer.
+        #
+        # The whole float is 20.000000 USDC and cannot be minted — testnet
+        # USDC is treasuried at 0.0.5176 — so three customers at the old
+        # target of 12 would have wanted 36 and the top-up would have chased a
+        # number that does not exist. 3 x 6 = 18 fits inside 20 and leaves the
+        # operator a working balance.
+        #
+        # Each run spends about 2.750000 per customer, so 6 covers two runs
+        # before the floor is reached, and earn income lands on the operator in
+        # the meantime for the next top-up to move back.
+        run: pnpm topup 6.000000 2.500000
+        env:
+          HEDERA_NETWORK: testnet
+          HEDERA_OPERATOR_ID: ${{ secrets.HEDERA_OPERATOR_ID }}
+          HEDERA_OPERATOR_KEY: ${{ secrets.HEDERA_OPERATOR_KEY }}
+          USDC_TOKEN_ID: ${{ secrets.USDC_TOKEN_ID }}
+          DEMO_PAYER_ACCOUNT_ID: ${{ secrets.DEMO_PAYER_ACCOUNT_ID }}
+          DEMO_PAYER2_ACCOUNT_ID: ${{ secrets.DEMO_PAYER2_ACCOUNT_ID }}
+          DEMO_PAYER3_ACCOUNT_ID: ${{ secrets.DEMO_PAYER3_ACCOUNT_ID }}
+
+      # Earning is the half that raises a ceiling. Spending alone only walks the
+      # balance down, so a tab driven by purchases and nothing else stays
+      # Unrated forever and the ceiling chart is a flat line.
+      #
+      # NOT continue-on-error, and the earlier version was wrong to be.
+      #
+      # It was marked optional so a sleeping earn service could not fail a run
+      # that had already produced spend receipts. But those receipts are on
+      # chain the moment they are written — a red job does not retract them —
+      # so the only thing the flag protected was the tick mark. Meanwhile it
+      # hid that this step had NEVER succeeded once: it was passing
+      # DEMO_PAYER_ACCOUNT_ID to a script that reads PAYER_ACCOUNT_ID, so every
+      # run died on a missing variable and reported success.
+      #
+      # A step whose entire purpose is the tier must not be able to fail
+      # quietly.
+      # Earn from THREE customers, not one.
+      #
+      # A sole counterparty is CONCENTRATED, which multiplies its weight by 0.80
+      # on top of SHARED_FUNDING_ROOT (0.70) and YOUNG_ACCOUNT (0.60) — 33.6%
+      # combined, so 2.200000 gross counted as 0.235200. Spread across three, no
+      # single customer holds more than the 40% share cap, that multiplier stops
+      # applying, and the same gross is worth 42% instead.
+      #
+      # 55 calls each — 165 x 0.050000 = 8.250000 gross, about 3.465000 attested,
+      # 0.577500 per window over TRAILING_WINDOWS (6). Tier C needs 0.100000 and
+      # the ceiling needs revenue x 1.0 x 0.70 ramp to beat the 0.250000 starter
+      # floor, which wants 0.357143 — so this clears BOTH, and the published
+      # ceiling finally moves off the floor it has been pinned to since the tab
+      # was created.
+      #
+      # Sequential rather than parallel: three payers hitting the same tab
+      # concurrently would interleave holds against one ceiling and make the
+      # ledger harder to read for no extra evidence.
+      #
+      # NOT continue-on-error — see the note that was here before. This step had
+      # never once succeeded while wearing that flag.
+      - name: What the topic looks like now
+        if: always()
+        run: |
+          curl -sS --max-time 60 "${{ vars.TAB_GATEWAY_URL }}/v1/tabs/${{ secrets.TAB_ACCOUNT_ID }}" \
+            | python3 -m json.tool || true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Earning, three customers at once.
+  #
+  # These ran as three sequential steps: 165 x402 settlements at ~4s each, about
+  # eleven minutes of a runner waiting on consensus one call at a time. They have
+  # no reason to be ordered — each customer pays from its own account, and the
+  # gateway credits the same tab either way — so the wall clock drops to roughly
+  # a third.
+  #
+  # `fail-fast: false` because one customer running out of float is not a reason
+  # to abandon revenue the other two are still earning.
+  # ───────────────────────────────────────────────────────────────────────────
+  earn:
+    needs: spend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        customer:
+          - { n: '1', id: DEMO_PAYER_ACCOUNT_ID,  key: DEMO_PAYER_ACCOUNT_KEY }
+          - { n: '2', id: DEMO_PAYER2_ACCOUNT_ID, key: DEMO_PAYER2_ACCOUNT_KEY }
+          - { n: '3', id: DEMO_PAYER3_ACCOUNT_ID, key: DEMO_PAYER3_ACCOUNT_KEY }
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.20.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Earn — customer ${{ matrix.customer.n }}
+        run: pnpm demo:earn
+        env:
+          TAB_GATEWAY_URL: ${{ vars.TAB_GATEWAY_URL }}
+          # 55 x 0.050000 each, 165 gross across the three.
+          #
+          # Sized against ATTESTED revenue: the counterparties weigh 42% once no
+          # one of them holds more than the 40% share cap, so 8.250000 gross is
+          # about 3.465000 attested, 0.577500 per window over TRAILING_WINDOWS.
+          # Tier C needs 0.100000 and beating the starter floor needs 0.357143.
+          EARN_CALLS: '55'
+          TAB_ACCOUNT_ID: ${{ secrets.TAB_ACCOUNT_ID }}
+          USDC_TOKEN_ID: ${{ secrets.USDC_TOKEN_ID }}
+          HEDERA_OPERATOR_ID: ${{ secrets.HEDERA_OPERATOR_ID }}
+          HEDERA_OPERATOR_KEY: ${{ secrets.HEDERA_OPERATOR_KEY }}
+          PAYER_ACCOUNT_ID: ${{ secrets[matrix.customer.id] }}
+          PAYER_ACCOUNT_KEY: ${{ secrets[matrix.customer.key] }}
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Close the loop: settle the window the earning landed in, then score it.
+  #
+  # These were three workflows a human triggered in order, and the order is not
+  # optional — earn, then the window has to CLOSE, then settle, then score.
+  # Doing it by hand meant the 30-minute revenue memory usually expired before
+  # the last step ran, so the tier kept falling back to Unrated between
+  # attempts. One job, one ordering, no operator.
+  #
+  # The engine runs TWICE on purpose. A ceiling may not grow mid-window: the
+  # first pass computes the growth and records it as pending, the settlement
+  # between them is the clean window that pays for it, and the second pass
+  # applies it. One pass can only ever leave it hold_pending.
+  # ───────────────────────────────────────────────────────────────────────────
+  close:
+    needs: earn
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.20.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # The window the earning landed in has to close before its receipts can
+      # be settled or scored. Sleeping the full window length is the simple
+      # correct answer; computing the remainder would save a couple of minutes
+      # and get the boundary wrong at least once.
+      - name: Wait for the window to close
+        run: sleep $(( ${{ vars.WINDOW_SECONDS || '300' }} + 30 ))
+
+      - name: Settle the closed window
+        run: pnpm settle --acknowledge-duplicates
+        env: &chain
+          HEDERA_NETWORK: testnet
+          DEMO_MODE: ${{ vars.DEMO_MODE || 'true' }}
+          WINDOW_SECONDS: ${{ vars.WINDOW_SECONDS || '300' }}
+          TRAILING_WINDOWS: ${{ vars.TRAILING_WINDOWS || '6' }}
+          HEDERA_OPERATOR_ID: ${{ secrets.HEDERA_OPERATOR_ID }}
+          HEDERA_OPERATOR_KEY: ${{ secrets.HEDERA_OPERATOR_KEY }}
+          USDC_TOKEN_ID: ${{ secrets.USDC_TOKEN_ID }}
+          TAB_ACCOUNT_ID: ${{ secrets.TAB_ACCOUNT_ID }}
+          TOPIC_RECEIPTS: ${{ secrets.TOPIC_RECEIPTS }}
+          TOPIC_CEILINGS: ${{ secrets.TOPIC_CEILINGS }}
+          TOPIC_SETTLEMENTS: ${{ secrets.TOPIC_SETTLEMENTS }}
+          FAUCET_ACCOUNT_ID: ${{ secrets.FAUCET_ACCOUNT_ID }}
+          FAUCET_ACCOUNT_KEY: ${{ secrets.FAUCET_ACCOUNT_KEY }}
+
+      - name: Score it — computes the growth, records it pending
+        run: pnpm engine:once --publish
+        env: *chain
+
+      # A SECOND window has to close first, and leaving this out meant the
+      # growth never landed.
+      #
+      # The release needs a clean settlement that happens AFTER the pending
+      # increase is recorded. Settling twice in a row does not produce one:
+      # the first pass already settled every closed window, so the second had
+      # nothing to do and the engine kept reporting hold_pending — computed
+      # 0.2589, enforced 0.2500, cycle after cycle, with the arithmetic
+      # correct and the ceiling frozen.
+      - name: Wait for a second window to close
+        run: sleep $(( ${{ vars.WINDOW_SECONDS || '300' }} + 30 ))
+
+      - name: Settle again — the clean window that pays for the growth
+        run: pnpm settle --acknowledge-duplicates
+        env: *chain
+
+      - name: Score again — applies it
+        run: pnpm engine:once --publish
+        env: *chain
+
+      - name: Where the tab ended up
+        if: always()
+        run: |
+          curl -sS --max-time 60 \
+            "${{ vars.TAB_GATEWAY_URL }}/v1/tabs/${{ secrets.TAB_ACCOUNT_ID }}/ceiling" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);i=d['inputs'];print(f\"  tier {i['tier']} x{i['multBp']/10000} ramp {i['rampBp']/100}% revenue {i['revenue']} -> ceiling {d['ceiling']} ({d['binding']})\")"
