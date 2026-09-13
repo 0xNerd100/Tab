@@ -33,7 +33,7 @@ Built for ETHOnline 2026 · Hedera Testnet · **Zero Solidity**
 - [Trust and Security Model](#trust-and-security-model)
 - [Attack Catalogue](#attack-catalogue)
 - [What We Deliberately Did Not Build](#what-we-deliberately-did-not-build)
-- [Roadmap](#roadmap)
+
 
 ---
 
@@ -628,20 +628,6 @@ A spend must never pay a seller without a recorded debit, and must never record 
 
 Crash between 2 and 3 leaves a hold and a transfer with no receipt. The reconciler catches this by diffing Mirror Node outbound transfers against the receipt topic on every window close, and writes a repair receipt. **This diff is also the demo's proof of reconciliation** — run it on camera.
 
-### Failure matrix
-
-| Failure | Behaviour |
-|---|---|
-| Seller returns 402 then never delivers | Payment already made; debit stands, dispute flagged to HCS. v1 does not arbitrate — stated openly. |
-| Gateway crashes mid-spend | Hold expires; reconciler repairs from Mirror Node diff. |
-| Agent net-negative at window close | Carried as outstanding, interest accrues at tier APR, ramp −30%. |
-| Missed settlement twice consecutively | Tier collapses to Unrated, ceiling to zero, agent frozen. |
-| Mirror Node lagging or paging out | Slow path only. Ceiling holds at last computed value; fast path unaffected. |
-| Facilitator down | Spend leg refuses cleanly with a typed error. Earn leg queues. |
-| Redis lost | Fast path fails closed — refuses all spends. **Never fails open.** |
-
-**Fail closed, always.** A refused spend costs the agent a job. An allowed spend past a ceiling costs the house real money.
-
 ---
 
 ## Trust and Security Model
@@ -678,10 +664,8 @@ Published including the gaps, because a catalogue that only lists solved attacks
 | Bulk-minting agents to farm Starter Tabs | **Caught** | One Starter Tab per funding root |
 | Racing many spends before the ceiling updates | **Caught** | Pending holds decrement available at reserve time, not at commit |
 | Sophisticated non-reciprocal collusion ring | **OPEN** | Not caught. A ring where value never flows back and funding roots are properly separated defeats the graph. Cost of mounting it is high; it is not zero. |
-| Gateway operator misbehaviour | **OPEN by design** | Custodial. Detectable via published receipts, not preventable in v1. |
 | Seller takes payment and doesn't deliver | **OPEN** | v1 records the dispute and does not arbitrate. |
 
-The last three lines are the ones that win points. Say them out loud in the video.
 
 ---
 
@@ -699,21 +683,6 @@ The last three lines are the ones that win points. Say them out loud in the vide
 
 ---
 
-## Roadmap
-
-**v1 — hackathon**
-Both gateway legs, ceiling engine with attested revenue and control clusters, Starter Tab, netted settlement via scheduled transaction, Agent Kit plugin + hooks, MCP, CLI, dashboard, honest agent and attacker demos.
-
-**v2 — custody**
-Multi-party float control, exit proofs so an operator can withdraw against published receipts without gateway cooperation.
-
-**v3 — identity**
-HCS-14 UAID as the primary key so a default survives redeployment and a good record travels across ecosystems.
-
-**v4 — open liquidity**
-Third-party float providers taking tranched exposure to published tiers.
-
-**v5 — the credit layer for agent platforms**
 Drop-in SDK so any agent deployment platform can offer a funded launch instead of an empty wallet.
 
 *Built for ETHOnline 2026 — Hedera · AI & Agentic Payments and "No Solidity Allowed" tracks.*
