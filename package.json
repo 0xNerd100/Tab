@@ -4,7 +4,7 @@
   "type": "module",
   "packageManager": "pnpm@11.13.1",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.9.0"
   },
   "scripts": {
     "build": "turbo run build",
@@ -37,6 +37,7 @@
     "token:mint": "pnpm --filter @tab/bootstrap token:mint",
     "probe3": "pnpm --filter @tab/bootstrap probe3",
     "chain:status": "pnpm --filter @tab/bootstrap status",
+    "mcp": "pnpm --filter @tab/mcp start",
     "evm:account": "pnpm --filter @tab/bootstrap evm:account",
     "faucet:sweep": "pnpm --filter @tab/bootstrap faucet:sweep",
     "faucet:watch": "pnpm --filter @tab/bootstrap faucet:watch",
@@ -62,7 +63,10 @@
     "attack": "pnpm --filter @tab/loop-attacker attack",
     "verify-tab": "pnpm --filter @tab/verify verify-tab",
     "verify-ceiling": "pnpm --filter @tab/verify verify-ceiling",
-    "demo:payer": "pnpm --filter @tab/bootstrap demo:payer"
+    "demo:payer": "pnpm --filter @tab/bootstrap demo:payer",
+    "fund": "pnpm --filter @tab/bootstrap fund",
+    "tab": "pnpm --filter @tab/cli start",
+    "topup": "pnpm --filter @tab/bootstrap topup"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.3.0",
