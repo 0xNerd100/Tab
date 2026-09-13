@@ -8,6 +8,67 @@ The ceiling on how negative that balance can go is the credit product.
 
 Built for ETHOnline 2026 · Hedera Testnet · **Zero Solidity**
 
+**[Live console](https://web-pi-topaz-95.vercel.app/)** · one agent trading on
+Hedera testnet, every figure read off a public HCS topic.
+
+---
+
+## Install
+
+```bash
+npm i @0xdivyanshh/tab-sdk
+```
+
+```ts
+import { createTab } from '@0xdivyanshh/tab-sdk'
+
+const tab = createTab({ baseUrl: 'https://tab-gateway.onrender.com' })
+
+// The price is the seller's, from its 402. You do not name one.
+const result = await tab.spend({
+  tab: '0.0.10390398',
+  url: 'https://tab-seller.onrender.com/feed/25',
+})
+
+if (result.outcome === 'refused') {
+  result.rule      // 'PER_CALL_CAP' — a 200, not an error
+  result.guidance  // what to do instead
+}
+```
+
+### Give your own LLM a tab
+
+Add this to Claude Desktop and the model gets seven tools. It holds no key and
+cannot produce a transaction — every spend goes through the gateway, against a
+ceiling the agent earned.
+
+```json
+{
+  "mcpServers": {
+    "tab": {
+      "command": "npx",
+      "args": ["-y", "@0xdivyanshh/tab-mcp"],
+      "env": {
+        "TAB_GATEWAY_URL": "https://tab-gateway.onrender.com",
+        "TAB_ACCOUNT_ID": "0.0.10390398"
+      }
+    }
+  }
+}
+```
+
+| package | |
+|---|---|
+| [`@0xdivyanshh/tab-sdk`](https://www.npmjs.com/package/@0xdivyanshh/tab-sdk) | the client — ten verbs, two of which spend |
+| [`@0xdivyanshh/tab-mcp`](https://www.npmjs.com/package/@0xdivyanshh/tab-mcp) | MCP server, `npx`-runnable |
+| [`@0xdivyanshh/tab-protocol`](https://www.npmjs.com/package/@0xdivyanshh/tab-protocol) | HCS message schemas, refusal codes, HCS-14 |
+| [`@0xdivyanshh/tab-params`](https://www.npmjs.com/package/@0xdivyanshh/tab-params) | the frozen credit parameter sets |
+| [`@0xdivyanshh/tab-money`](https://www.npmjs.com/package/@0xdivyanshh/tab-money) | integer money — bigint micro-USDC, basis points |
+
+Published as `@0xdivyanshh/tab-*` rather than `@tab/*` because the `tab` org on
+npm belongs to someone else; the workspace keeps its own names and the rename
+happens at publish time.
+
 ---
 
 ## Table of Contents
