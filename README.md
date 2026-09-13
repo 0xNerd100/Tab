@@ -561,7 +561,7 @@ tab/
 ## Getting Started
 
 ```bash
-git clone https://github.com/<org>/tab
+git clone https://github.com/0xNerd100/Tab.git
 cd tab
 pnpm install
 cp .env.example .env
